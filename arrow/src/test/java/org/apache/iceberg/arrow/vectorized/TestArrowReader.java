@@ -21,6 +21,7 @@ package org.apache.iceberg.arrow.vectorized;
 import static org.apache.iceberg.Files.localInput;
 import static org.apache.parquet.schema.Types.primitive;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.File;
 import java.io.IOException;
@@ -381,6 +382,69 @@ public class TestArrowReader {
     }
 
     assertThat(totalRowsRead).as("Should read all rows").isEqualTo(millisValues.size());
+  }
+
+  @Test
+  public void testUnsignedIntegerColumnThrowsException() throws Exception {
+    tables = new HadoopTables();
+
+    for (int[] spec : new int[][] {{8, 32}, {16, 32}, {32, 32}, {64, 64}}) {
+      int unsignedBitWidth = spec[0];
+      int physicalBitWidth = spec[1];
+      PrimitiveType.PrimitiveTypeName physicalType =
+          physicalBitWidth == 32
+              ? PrimitiveType.PrimitiveTypeName.INT32
+              : PrimitiveType.PrimitiveTypeName.INT64;
+
+      Schema schema =
+          new Schema(Types.NestedField.optional(1, "col", Types.IntegerType.get()));
+      Table table = tables.create(schema, tempDir.toURI() + "/uint" + unsignedBitWidth);
+
+      MessageType parquetSchema =
+          new MessageType(
+              "test",
+              primitive(physicalType, Type.Repetition.OPTIONAL)
+                  .as(LogicalTypeAnnotation.intType(unsignedBitWidth, false))
+                  .id(1)
+                  .named("col"));
+
+      File testFile = new File(tempDir, "unsigned-int" + unsignedBitWidth + ".parquet");
+      try (ParquetWriter<Group> writer =
+          ExampleParquetWriter.builder(new Path(testFile.toURI()))
+              .withType(parquetSchema)
+              .build()) {
+        SimpleGroupFactory factory = new SimpleGroupFactory(parquetSchema);
+        Group group = factory.newGroup();
+        if (physicalBitWidth == 32) {
+          group.add("col", 100);
+        } else {
+          group.add("col", 100L);
+        }
+        writer.write(group);
+      }
+
+      DataFile dataFile =
+          DataFiles.builder(PartitionSpec.unpartitioned())
+              .withPath(testFile.getAbsolutePath())
+              .withFileSizeInBytes(testFile.length())
+              .withFormat(FileFormat.PARQUET)
+              .withRecordCount(1)
+              .build();
+      table.newAppend().appendFile(dataFile).commit();
+
+      assertThatThrownBy(
+              () -> {
+                try (VectorizedTableScanIterable vectorizedReader =
+                    new VectorizedTableScanIterable(table.newScan(), 1024, false)) {
+                  for (ColumnarBatch batch : vectorizedReader) {
+                    batch.createVectorSchemaRootFromVectors().close();
+                  }
+                }
+              })
+          .isInstanceOf(UnsupportedOperationException.class)
+          .hasMessageContaining("unsigned integer")
+          .hasMessageContaining("col");
+    }
   }
 
   /**

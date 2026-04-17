@@ -396,8 +396,7 @@ public class TestArrowReader {
               ? PrimitiveType.PrimitiveTypeName.INT32
               : PrimitiveType.PrimitiveTypeName.INT64;
 
-      Schema schema =
-          new Schema(Types.NestedField.optional(1, "col", Types.IntegerType.get()));
+      Schema schema = new Schema(Types.NestedField.optional(1, "col", Types.IntegerType.get()));
       Table table = tables.create(schema, tempDir.toURI() + "/uint" + unsignedBitWidth);
 
       MessageType parquetSchema =

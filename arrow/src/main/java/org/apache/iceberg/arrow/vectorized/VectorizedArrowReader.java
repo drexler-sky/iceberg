@@ -590,7 +590,8 @@ public class VectorizedArrowReader implements VectorizedReader<VectorHolder> {
                 java.util.Locale.ROOT,
                 "Cannot read unsigned integer column '%s' (uint%d): "
                     + "Iceberg does not support unsigned integer types",
-                primitive.getName(), intLogicalType.getBitWidth()));
+                primitive.getName(),
+                intLogicalType.getBitWidth()));
       }
       FieldVector vector = arrowField.createVector(rootAlloc);
       int bitWidth = intLogicalType.getBitWidth();

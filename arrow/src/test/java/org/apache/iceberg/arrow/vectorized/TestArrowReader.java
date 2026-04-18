@@ -42,6 +42,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.DateDayVector;
@@ -102,6 +103,9 @@ import org.apache.parquet.schema.Type;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 /**
  * Test cases for {@link ArrowReader}.
@@ -384,17 +388,82 @@ public class TestArrowReader {
     assertThat(totalRowsRead).as("Should read all rows").isEqualTo(millisValues.size());
   }
 
+  private static Stream<Arguments> rejectedUnsignedIntegerCases() {
+    return Stream.of(
+        Arguments.of(
+            32,
+            PrimitiveType.PrimitiveTypeName.INT32,
+            new Schema(Types.NestedField.optional(1, "col", Types.IntegerType.get())),
+            "Cannot read UINT32 as an int value"),
+        Arguments.of(
+            64,
+            PrimitiveType.PrimitiveTypeName.INT64,
+            new Schema(Types.NestedField.optional(1, "col", Types.LongType.get())),
+            "Cannot read UINT64 as a long value"));
+  }
+
+  @ParameterizedTest
+  @MethodSource("rejectedUnsignedIntegerCases")
+  public void testUnsignedIntegerColumnThrowsException(
+      int unsignedBitWidth,
+      PrimitiveType.PrimitiveTypeName physicalType,
+      Schema schema,
+      String expectedMessage)
+      throws Exception {
+    tables = new HadoopTables();
+    Table table = tables.create(schema, tempDir.toURI() + "/uint" + unsignedBitWidth);
+
+    MessageType parquetSchema =
+        new MessageType(
+            "test",
+            primitive(physicalType, Type.Repetition.OPTIONAL)
+                .as(LogicalTypeAnnotation.intType(unsignedBitWidth, false))
+                .id(1)
+                .named("col"));
+
+    File testFile =
+        new File(tempDir, "unsigned-int" + unsignedBitWidth + "-" + System.nanoTime() + ".parquet");
+    try (ParquetWriter<Group> writer =
+        ExampleParquetWriter.builder(new Path(testFile.toURI())).withType(parquetSchema).build()) {
+      SimpleGroupFactory factory = new SimpleGroupFactory(parquetSchema);
+      Group group = factory.newGroup();
+      if (unsignedBitWidth == 64) {
+        group.add("col", 100L);
+      } else {
+        group.add("col", 100);
+      }
+      writer.write(group);
+    }
+
+    DataFile dataFile =
+        DataFiles.builder(PartitionSpec.unpartitioned())
+            .withPath(testFile.getAbsolutePath())
+            .withFileSizeInBytes(testFile.length())
+            .withFormat(FileFormat.PARQUET)
+            .withRecordCount(1)
+            .build();
+    table.newAppend().appendFile(dataFile).commit();
+
+    assertThatThrownBy(
+            () -> {
+              try (VectorizedTableScanIterable vectorizedReader =
+                  new VectorizedTableScanIterable(table.newScan(), 1024, false)) {
+                for (ColumnarBatch batch : vectorizedReader) {
+                  batch.createVectorSchemaRootFromVectors().close();
+                }
+              }
+            })
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(expectedMessage);
+  }
+
   @Test
-  public void testUnsignedIntegerColumnThrowsException() throws Exception {
+  public void testUnsignedSmallIntegerColumnRoundtrips() throws Exception {
     tables = new HadoopTables();
 
-    for (int[] spec : new int[][] {{8, 32}, {16, 32}, {32, 32}, {64, 64}}) {
+    for (int[] spec : new int[][] {{8, 250}, {16, 50000}}) {
       int unsignedBitWidth = spec[0];
-      int physicalBitWidth = spec[1];
-      PrimitiveType.PrimitiveTypeName physicalType =
-          physicalBitWidth == 32
-              ? PrimitiveType.PrimitiveTypeName.INT32
-              : PrimitiveType.PrimitiveTypeName.INT64;
+      int value = spec[1];
 
       Schema schema = new Schema(Types.NestedField.optional(1, "col", Types.IntegerType.get()));
       Table table = tables.create(schema, tempDir.toURI() + "/uint" + unsignedBitWidth);
@@ -402,23 +471,21 @@ public class TestArrowReader {
       MessageType parquetSchema =
           new MessageType(
               "test",
-              primitive(physicalType, Type.Repetition.OPTIONAL)
+              primitive(PrimitiveType.PrimitiveTypeName.INT32, Type.Repetition.OPTIONAL)
                   .as(LogicalTypeAnnotation.intType(unsignedBitWidth, false))
                   .id(1)
                   .named("col"));
 
-      File testFile = new File(tempDir, "unsigned-int" + unsignedBitWidth + ".parquet");
+      File testFile =
+          new File(
+              tempDir, "unsigned-int" + unsignedBitWidth + "-" + System.nanoTime() + ".parquet");
       try (ParquetWriter<Group> writer =
           ExampleParquetWriter.builder(new Path(testFile.toURI()))
               .withType(parquetSchema)
               .build()) {
         SimpleGroupFactory factory = new SimpleGroupFactory(parquetSchema);
         Group group = factory.newGroup();
-        if (physicalBitWidth == 32) {
-          group.add("col", 100);
-        } else {
-          group.add("col", 100L);
-        }
+        group.add("col", value);
         writer.write(group);
       }
 
@@ -431,18 +498,20 @@ public class TestArrowReader {
               .build();
       table.newAppend().appendFile(dataFile).commit();
 
-      assertThatThrownBy(
-              () -> {
-                try (VectorizedTableScanIterable vectorizedReader =
-                    new VectorizedTableScanIterable(table.newScan(), 1024, false)) {
-                  for (ColumnarBatch batch : vectorizedReader) {
-                    batch.createVectorSchemaRootFromVectors().close();
-                  }
-                }
-              })
-          .isInstanceOf(UnsupportedOperationException.class)
-          .hasMessageContaining("unsigned integer")
-          .hasMessageContaining("col");
+      int totalRows = 0;
+      try (VectorizedTableScanIterable vectorizedReader =
+          new VectorizedTableScanIterable(table.newScan(), 1024, false)) {
+        for (ColumnarBatch batch : vectorizedReader) {
+          VectorSchemaRoot root = batch.createVectorSchemaRootFromVectors();
+          assertThat(((IntVector) root.getVector("col")).get(0))
+              .as("UINT%d value should round-trip through int", unsignedBitWidth)
+              .isEqualTo(value);
+          totalRows += root.getRowCount();
+          root.close();
+        }
+      }
+
+      assertThat(totalRows).isEqualTo(1);
     }
   }
 
